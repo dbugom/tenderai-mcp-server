@@ -68,15 +68,19 @@ systemctl enable tenderai
 # --- Nginx reverse proxy ---
 echo "[8/8] Configuring nginx..."
 if [ -n "$DOMAIN" ]; then
-    sed "s/tender.yourdomain.com/$DOMAIN/g" nginx/tenderai.conf > /etc/nginx/sites-available/tenderai
+    sed "s/tender.yfi.ae/$DOMAIN/g" nginx/tenderai.conf > /etc/nginx/sites-available/tenderai
     ln -sf /etc/nginx/sites-available/tenderai /etc/nginx/sites-enabled/
     rm -f /etc/nginx/sites-enabled/default
-    nginx -t && systemctl reload nginx
+
+    # Start with HTTP-only config first (no SSL references yet)
+    nginx -t && systemctl restart nginx
 
     echo ""
     echo "  Obtaining SSL certificate for $DOMAIN..."
+    echo "  (certbot will automatically configure HTTPS in the nginx config)"
     certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos --register-unsafely-without-email || {
-        echo "  Warning: certbot failed. You may need to run it manually."
+        echo "  Warning: certbot failed. Make sure DNS for $DOMAIN points to this server."
+        echo "  Run manually later: certbot --nginx -d $DOMAIN"
     }
 fi
 
