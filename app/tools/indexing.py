@@ -1,4 +1,7 @@
-"""Past Proposal Indexing tools — parse, summarize, and search past proposals.
+"""Past Proposal Indexing tools — parse, save, and search past proposals.
+
+Data-tool pattern: index_past_proposal parses files and returns raw text.
+Claude structures the metadata, then calls save_proposal_index to store it.
 
 Supports two search modes:
 - FTS5: keyword search with BM25 ranking (always available)
@@ -16,8 +19,6 @@ from typing import Optional
 from mcp.server.fastmcp import FastMCP
 
 from app.db.database import Database
-from app.services.embeddings import EmbeddingService
-from app.services.llm import LLMService
 from app.services.parser import ParserService
 
 logger = logging.getLogger(__name__)
@@ -25,7 +26,7 @@ logger = logging.getLogger(__name__)
 # File extensions we can parse
 INDEXABLE_EXTENSIONS = {".pdf", ".docx", ".doc", ".xlsx", ".xls", ".md", ".txt"}
 
-# Budget for combined text sent to LLM
+# Budget for combined text returned to Claude
 MAX_TOTAL_CHARS = 25_000
 FINANCIAL_RESERVE_CHARS = 8_000
 
@@ -39,11 +40,7 @@ def _rrf_combine(
     fts_weight: float = 1.0,
     vec_weight: float = 1.0,
 ) -> list[dict]:
-    """Combine FTS5 and vector search results using Reciprocal Rank Fusion.
-
-    RRF score = sum(weight / (k + rank)) across both result lists.
-    Higher score = better match.
-    """
+    """Combine FTS5 and vector search results using Reciprocal Rank Fusion."""
     scores: dict[str, float] = {}
     docs: dict[str, dict] = {}
 
@@ -58,7 +55,6 @@ def _rrf_combine(
         if doc_id not in docs:
             docs[doc_id] = doc
 
-    # Sort by combined RRF score descending
     ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     return [
         {**docs[doc_id], "rrf_score": score}
@@ -69,10 +65,9 @@ def _rrf_combine(
 def register_indexing_tools(
     mcp: FastMCP,
     db: Database,
-    llm: LLMService,
     parser: ParserService,
     data_dir: Path,
-    embeddings: Optional[EmbeddingService] = None,
+    embeddings=None,
 ) -> None:
     """Register past proposal indexing and search tools on the MCP server."""
 
@@ -94,18 +89,18 @@ def register_indexing_tools(
 
     @mcp.tool()
     async def index_past_proposal(folder_name: str) -> dict:
-        """Parse all files in a past proposal folder, extract structured metadata via LLM, and index for fast search.
+        """Parse all files in a past proposal folder and return raw content for analysis.
 
         Scans the folder, parses all supported files (PDF, DOCX, XLSX, MD, TXT),
-        sends combined content to the LLM for structured extraction, saves a
-        human-readable _summary.md file, and upserts the index into the database
-        for FTS5 full-text search.
+        and returns the combined content. You (Claude) should analyze the content,
+        extract structured metadata, then call save_proposal_index to store it.
 
         Args:
             folder_name: Name of the folder inside data/past_proposals/
 
         Returns:
-            Dict with index_id, folder_name, title, client, sector, file_count, and technologies
+            Dict with folder_name, file_list, combined_text (with financial data prioritized),
+            and file_count
         """
         folder_path = past_dir / folder_name
         if not folder_path.exists() or not folder_path.is_dir():
@@ -125,7 +120,7 @@ def register_indexing_tools(
             raise ValueError(f"No parseable files found in {folder_path}")
 
         file_list = [f.name for f in files]
-        logger.info("Indexing %d files from %s", len(files), folder_name)
+        logger.info("Parsing %d files from %s", len(files), folder_name)
 
         # Parse files, separating financial (XLSX) from others
         financial_texts = []
@@ -143,7 +138,6 @@ def register_indexing_tools(
         financial_combined = "\n\n".join(financial_texts)
         other_combined = "\n\n".join(other_texts)
 
-        # Truncate: reserve space for financial data
         if financial_combined:
             financial_combined = financial_combined[:FINANCIAL_RESERVE_CHARS]
             remaining = MAX_TOTAL_CHARS - len(financial_combined)
@@ -155,51 +149,91 @@ def register_indexing_tools(
         if financial_combined:
             combined_text += "\n\n--- FINANCIAL DATA ---\n\n" + financial_combined
 
-        # Call LLM for structured extraction
-        user_prompt = (
-            f"Analyze the following past proposal documents from folder '{folder_name}' "
-            f"and extract structured metadata.\n\n"
-            f"Files: {', '.join(file_list)}\n\n"
-            f"{combined_text}"
-        )
+        return {
+            "folder_name": folder_name,
+            "file_list": file_list,
+            "file_count": len(files),
+            "combined_text": combined_text,
+            "instructions": (
+                "Analyze the above content and extract structured metadata as JSON with these fields:\n"
+                "tender_number, title, client, sector (telecom|it|infrastructure|security|energy|general), "
+                "country (2-letter code), technical_summary, pricing_summary, total_price (float), "
+                "margin_info, technologies (list), keywords (10-20 items), full_summary.\n"
+                "Then call save_proposal_index with the extracted data."
+            ),
+        }
 
-        raw_response = await llm.generate_section(
-            "proposal_summary", user_prompt, max_tokens=4096
-        )
+    @mcp.tool()
+    async def save_proposal_index(
+        folder_name: str,
+        title: str,
+        client: str = "",
+        sector: str = "",
+        country: str = "",
+        tender_number: str = "",
+        technical_summary: str = "",
+        pricing_summary: str = "",
+        total_price: float = 0.0,
+        margin_info: str = "",
+        technologies: Optional[list] = None,
+        keywords: Optional[list] = None,
+        full_summary: str = "",
+    ) -> dict:
+        """Save structured proposal metadata extracted by Claude into the search index.
 
-        # Parse JSON response (handle ```json blocks)
-        json_text = raw_response.strip()
-        if json_text.startswith("```"):
-            # Remove opening ```json or ``` and closing ```
-            lines = json_text.split("\n")
-            lines = [l for l in lines if not l.strip().startswith("```")]
-            json_text = "\n".join(lines)
+        Call this after analyzing the raw content from index_past_proposal.
+        Generates _summary.md file and indexes for FTS5/vector search.
 
-        try:
-            extracted = json.loads(json_text)
-        except json.JSONDecodeError:
-            logger.error("LLM returned invalid JSON for %s: %s", folder_name, json_text[:200])
-            extracted = {
-                "title": folder_name,
-                "full_summary": raw_response[:1000],
-            }
+        Args:
+            folder_name: Name of the folder inside data/past_proposals/
+            title: Full tender/project title
+            client: Issuing organization name
+            sector: One of: telecom, it, infrastructure, security, energy, general
+            country: Two-letter country code
+            tender_number: RFP/tender reference number
+            technical_summary: 2-3 paragraph summary of the technical solution
+            pricing_summary: Summary of pricing structure
+            total_price: Total project price
+            margin_info: Margin percentages if found
+            technologies: List of specific products/vendors/technologies
+            keywords: 10-20 searchable keywords
+            full_summary: Comprehensive summary of the entire proposal
+
+        Returns:
+            Dict with index_id, folder_name, title, and vector_indexed status
+        """
+        folder_path = past_dir / folder_name
+        if not folder_path.exists():
+            raise ValueError(f"Folder not found: {folder_path}")
+
+        techs = technologies or []
+        kws = keywords or []
+
+        # Count files
+        files = [
+            f for f in folder_path.iterdir()
+            if f.is_file()
+            and f.suffix.lower() in INDEXABLE_EXTENSIONS
+            and not f.name.startswith("_")
+        ]
+        file_list = [f.name for f in files]
 
         # Build _summary.md for human readability
         summary_md = (
-            f"# {extracted.get('title', folder_name)}\n\n"
-            f"**Client:** {extracted.get('client', 'Unknown')}\n"
-            f"**Sector:** {extracted.get('sector', '')}\n"
-            f"**Country:** {extracted.get('country', '')}\n"
-            f"**Tender Number:** {extracted.get('tender_number', '')}\n\n"
-            f"## Technical Summary\n{extracted.get('technical_summary', '')}\n\n"
-            f"## Pricing Summary\n{extracted.get('pricing_summary', '')}\n"
-            f"**Total Price:** {extracted.get('total_price', 0.0)}\n"
-            f"**Margin Info:** {extracted.get('margin_info', '')}\n\n"
+            f"# {title}\n\n"
+            f"**Client:** {client}\n"
+            f"**Sector:** {sector}\n"
+            f"**Country:** {country}\n"
+            f"**Tender Number:** {tender_number}\n\n"
+            f"## Technical Summary\n{technical_summary}\n\n"
+            f"## Pricing Summary\n{pricing_summary}\n"
+            f"**Total Price:** {total_price}\n"
+            f"**Margin Info:** {margin_info}\n\n"
             f"## Technologies\n"
-            + "\n".join(f"- {t}" for t in extracted.get("technologies", []))
+            + "\n".join(f"- {t}" for t in techs)
             + f"\n\n## Keywords\n"
-            + ", ".join(extracted.get("keywords", []))
-            + f"\n\n## Full Summary\n{extracted.get('full_summary', '')}\n"
+            + ", ".join(kws)
+            + f"\n\n## Full Summary\n{full_summary}\n"
         )
         summary_path = folder_path / "_summary.md"
         summary_path.write_text(summary_md)
@@ -208,18 +242,18 @@ def register_indexing_tools(
         # Upsert into database (triggers auto-sync FTS5)
         index_record = await db.upsert_proposal_index(
             folder_name=folder_name,
-            tender_number=extracted.get("tender_number", ""),
-            title=extracted.get("title", folder_name),
-            client=extracted.get("client", ""),
-            sector=extracted.get("sector", ""),
-            country=extracted.get("country", ""),
-            technical_summary=extracted.get("technical_summary", ""),
-            pricing_summary=extracted.get("pricing_summary", ""),
-            total_price=float(extracted.get("total_price", 0.0)),
-            margin_info=extracted.get("margin_info", ""),
-            technologies=extracted.get("technologies", []),
-            keywords=extracted.get("keywords", []),
-            full_summary=extracted.get("full_summary", ""),
+            tender_number=tender_number,
+            title=title,
+            client=client,
+            sector=sector,
+            country=country,
+            technical_summary=technical_summary,
+            pricing_summary=pricing_summary,
+            total_price=total_price,
+            margin_info=margin_info,
+            technologies=techs,
+            keywords=kws,
+            full_summary=full_summary,
             file_count=len(files),
             file_list=file_list,
         )
@@ -231,12 +265,10 @@ def register_indexing_tools(
         if embeddings and db.vec_enabled:
             try:
                 embed_text = (
-                    f"{extracted.get('title', '')} "
-                    f"{extracted.get('client', '')} "
-                    f"{extracted.get('sector', '')} "
-                    f"{extracted.get('technical_summary', '')} "
-                    f"{' '.join(extracted.get('keywords', []))} "
-                    f"{extracted.get('full_summary', '')}"
+                    f"{title} {client} {sector} "
+                    f"{technical_summary} "
+                    f"{' '.join(kws)} "
+                    f"{full_summary}"
                 )
                 vector = await embeddings.embed(embed_text[:8000])
                 vector_stored = await db.upsert_proposal_vector(folder_name, vector)
@@ -248,11 +280,11 @@ def register_indexing_tools(
         return {
             "index_id": index_record["id"],
             "folder_name": folder_name,
-            "title": index_record.get("title", ""),
-            "client": index_record.get("client", ""),
-            "sector": index_record.get("sector", ""),
+            "title": title,
+            "client": client,
+            "sector": sector,
             "file_count": len(files),
-            "technologies": index_record.get("technologies", []),
+            "technologies": techs,
             "summary_path": str(summary_path),
             "vector_indexed": vector_stored,
         }
@@ -265,24 +297,21 @@ def register_indexing_tools(
 
         Modes:
         - "auto": Uses hybrid (FTS5 + vector RRF) if embeddings are available, otherwise FTS5-only
-        - "keyword": FTS5 only — supports quoted phrases ("core network"), prefix (cisco*), boolean (AND/OR)
-        - "semantic": Vector similarity only — finds conceptually similar proposals even without exact keyword matches
-        - "hybrid": Combines FTS5 + vector using Reciprocal Rank Fusion for best results
+        - "keyword": FTS5 only — supports quoted phrases, prefix (cisco*), boolean (AND/OR)
+        - "semantic": Vector similarity only — finds conceptually similar proposals
+        - "hybrid": Combines FTS5 + vector using Reciprocal Rank Fusion
 
         Args:
             query: Search query text
-            sector: Optional sector filter (telecom, it, infrastructure, security, energy, general)
+            sector: Optional sector filter
             limit: Maximum results to return (default 5)
             mode: Search mode — "auto", "keyword", "semantic", or "hybrid"
 
         Returns:
             Dict with matches (ranked list), result_count, and search_mode used
         """
-        use_fts = mode in ("auto", "keyword", "hybrid")
-        use_vec = mode in ("auto", "semantic", "hybrid")
         has_vec = embeddings is not None and db.vec_enabled
 
-        # Determine actual mode
         if mode == "auto":
             actual_mode = "hybrid" if has_vec else "keyword"
         elif mode in ("semantic", "hybrid") and not has_vec:
@@ -294,7 +323,6 @@ def register_indexing_tools(
         fts_results = []
         vec_results = []
 
-        # FTS5 search
         if actual_mode in ("keyword", "hybrid"):
             try:
                 fts_results = await db.search_proposal_index(
@@ -303,14 +331,12 @@ def register_indexing_tools(
             except Exception as e:
                 logger.warning("FTS5 search failed: %s", e)
 
-        # Vector search
         if actual_mode in ("semantic", "hybrid") and has_vec:
             try:
                 query_vec = await embeddings.embed_query(query)
                 vec_results = await db.search_proposal_vector(
                     query_vec, limit=limit * 2
                 )
-                # Apply sector filter to vector results if specified
                 if sector and vec_results:
                     vec_results = [
                         r for r in vec_results
@@ -319,7 +345,6 @@ def register_indexing_tools(
             except Exception as e:
                 logger.warning("Vector search failed: %s", e)
 
-        # Combine results
         if actual_mode == "hybrid" and fts_results and vec_results:
             combined = _rrf_combine(fts_results, vec_results)[:limit]
         elif actual_mode == "semantic" and vec_results:
