@@ -168,3 +168,24 @@ class PartnerDeliverable(BaseModel):
     notes: str = ""
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
+
+
+class PastProposalIndex(BaseModel):
+    id: str
+    folder_name: str
+    tender_number: str = ""
+    title: str = ""
+    client: str = ""
+    sector: str = ""
+    country: str = ""
+    technical_summary: str = ""
+    pricing_summary: str = ""
+    total_price: float = 0.0
+    margin_info: str = ""
+    technologies: list = Field(default_factory=list)
+    keywords: list = Field(default_factory=list)
+    full_summary: str = ""
+    file_count: int = 0
+    file_list: list = Field(default_factory=list)
+    indexed_at: Optional[str] = None
+    updated_at: Optional[str] = None

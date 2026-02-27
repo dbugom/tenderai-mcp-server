@@ -29,6 +29,11 @@ class Settings:
     llm_model: str = "claude-sonnet-4-5-20241022"
     llm_max_tokens: int = 4096
 
+    # Embeddings (Voyage AI)
+    voyage_api_key: str = ""
+    embedding_model: str = "voyage-3-lite"
+    embedding_dimensions: int = 512
+
     # Database
     database_path: str = "db/tenderai.db"
 
@@ -68,6 +73,9 @@ def load_settings() -> Settings:
         anthropic_api_key=os.getenv("ANTHROPIC_API_KEY", ""),
         llm_model=os.getenv("LLM_MODEL", "claude-sonnet-4-5-20241022"),
         llm_max_tokens=int(os.getenv("LLM_MAX_TOKENS", "4096")),
+        voyage_api_key=os.getenv("VOYAGE_API_KEY", ""),
+        embedding_model=os.getenv("EMBEDDING_MODEL", "voyage-3-lite"),
+        embedding_dimensions=int(os.getenv("EMBEDDING_DIMENSIONS", "512")),
         database_path=os.getenv("DATABASE_PATH", "db/tenderai.db"),
         data_dir=os.getenv("DATA_DIR", "data"),
         company_name=os.getenv("COMPANY_NAME", "Your Company"),

@@ -91,6 +91,30 @@ PROMPT_TEMPLATES: dict[str, str] = {
         "risk assessment, recommended partners/subcontractors, estimated effort, "
         "key compliance requirements, and strategic considerations."
     ),
+    "proposal_summary": (
+        "You are an expert analyst extracting structured metadata from a past tender proposal. "
+        "Analyze all provided documents and return ONLY a valid JSON object with these fields:\n"
+        "{\n"
+        '  "tender_number": "exact RFP/tender reference number or empty string",\n'
+        '  "title": "full tender/project title",\n'
+        '  "client": "issuing organization name",\n'
+        '  "sector": "one of: telecom, it, infrastructure, security, energy, general",\n'
+        '  "country": "two-letter country code (e.g. OM, AE, SA)",\n'
+        '  "technical_summary": "2-3 paragraph summary of the technical solution proposed",\n'
+        '  "pricing_summary": "summary of pricing structure and key cost components",\n'
+        '  "total_price": 0.0,\n'
+        '  "margin_info": "margin percentages if found in Excel/financial data",\n'
+        '  "technologies": ["list", "of", "specific", "products", "vendors", "technologies"],\n'
+        '  "keywords": ["10-20", "searchable", "keywords", "covering", "scope", "sector", "tech"],\n'
+        '  "full_summary": "comprehensive 3-5 paragraph summary of the entire proposal"\n'
+        "}\n\n"
+        "Rules:\n"
+        "- Extract EXACT pricing figures from financial data, not estimates\n"
+        "- Include margin percentages from Excel/spreadsheet data if available\n"
+        "- List ALL specific product names, vendor names, and technologies mentioned\n"
+        "- Generate 10-20 diverse, searchable keywords covering scope, sector, technologies, and geography\n"
+        "- Return ONLY valid JSON — no markdown, no explanation, no wrapping"
+    ),
     "general": (
         "You are a professional proposal writer for a technology systems integrator. "
         "Write in formal, confident language appropriate for government and enterprise tender responses."

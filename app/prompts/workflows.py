@@ -24,12 +24,38 @@ def register_prompts(mcp: FastMCP, db: Database, llm: LLMService, data_dir: Path
         return ""
 
     async def _summarize_past_proposals() -> str:
+        # Primary: use indexed proposals from the database
+        try:
+            indexed = await db.list_proposal_indexes()
+            if indexed:
+                summaries = []
+                for r in indexed:
+                    techs = ", ".join(r.get("technologies", [])[:5])
+                    price = r.get("total_price", 0.0)
+                    price_str = f" | Value: {price:,.2f}" if price else ""
+                    summaries.append(
+                        f"- **{r.get('title', r['folder_name'])}** "
+                        f"[{r.get('sector', '')}] — {r.get('client', '')}"
+                        f"{price_str}"
+                        f" | Tech: {techs}" if techs else ""
+                    )
+                if summaries:
+                    return "\n".join(summaries)
+        except Exception as e:
+            logger.debug("Could not load indexed proposals: %s", e)
+
+        # Fallback: filesystem scan, prefer _summary.md files
         past_dir = data_dir / "past_proposals"
         if not past_dir.exists():
             return "No past proposals available."
         summaries = []
         for d in sorted(past_dir.iterdir()):
             if d.is_dir():
+                summary_file = d / "_summary.md"
+                if summary_file.exists():
+                    first_line = summary_file.read_text().split("\n")[0].lstrip("# ")
+                    summaries.append(f"- {d.name}: {first_line}")
+                    continue
                 files = list(d.glob("*.md")) + list(d.glob("*.txt"))
                 if files:
                     first_content = files[0].read_text()[:500]

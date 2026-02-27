@@ -1,4 +1,8 @@
-"""Bearer token authentication middleware for HTTP transport."""
+"""Bearer token authentication middleware for HTTP transport.
+
+Wraps the FastMCP Starlette ASGI app and validates the
+Authorization: Bearer <token> header against MCP_API_KEY.
+"""
 
 from __future__ import annotations
 
@@ -7,31 +11,57 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def create_auth_middleware(expected_key: str):
-    """Create a bearer token authentication middleware function.
+class BearerTokenMiddleware:
+    """ASGI middleware that validates a static Bearer token.
 
-    For FastMCP HTTP transport, we use an auth dependency that validates
-    the Authorization header on incoming requests.
-
-    Args:
-        expected_key: The expected bearer token value
-
-    Returns:
-        An async middleware function
+    Passes through OPTIONS requests (CORS preflight) without auth.
+    Returns 401 for missing/invalid tokens on all other requests.
     """
 
-    async def auth_middleware(request):
-        """Validate Bearer token on HTTP requests."""
-        auth_header = request.headers.get("authorization", "")
-        if not auth_header.startswith("Bearer "):
-            logger.warning("Missing or malformed Authorization header")
-            raise PermissionError("Missing Bearer token")
+    def __init__(self, app, expected_token: str) -> None:
+        self.app = app
+        self.expected_token = expected_token
 
-        token = auth_header.split(" ", 1)[1]
-        if token != expected_key:
-            logger.warning("Invalid Bearer token")
-            raise PermissionError("Invalid Bearer token")
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            # Pass through non-HTTP scopes (lifespan, websocket, etc.)
+            await self.app(scope, receive, send)
+            return
 
-        return True
+        # Allow CORS preflight without auth
+        method = scope.get("method", "")
+        if method == "OPTIONS":
+            await self.app(scope, receive, send)
+            return
 
-    return auth_middleware
+        # Extract Authorization header
+        headers = dict(scope.get("headers", []))
+        auth_value = headers.get(b"authorization", b"").decode()
+
+        if not auth_value.startswith("Bearer "):
+            logger.warning("Missing or malformed Authorization header from %s", scope.get("client"))
+            await self._send_401(send)
+            return
+
+        token = auth_value[7:]
+        if token != self.expected_token:
+            logger.warning("Invalid Bearer token from %s", scope.get("client"))
+            await self._send_401(send)
+            return
+
+        await self.app(scope, receive, send)
+
+    @staticmethod
+    async def _send_401(send) -> None:
+        await send({
+            "type": "http.response.start",
+            "status": 401,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"www-authenticate", b'Bearer error="invalid_token"'),
+            ],
+        })
+        await send({
+            "type": "http.response.body",
+            "body": b'{"error":"unauthorized","message":"Invalid or missing Bearer token"}',
+        })

@@ -101,3 +101,74 @@ CREATE TABLE IF NOT EXISTS partner_deliverable (
     created_at      TEXT DEFAULT (datetime('now')),
     updated_at      TEXT DEFAULT (datetime('now'))
 );
+
+-- Past Proposal Index — stores parsed & summarized metadata for fast search
+CREATE TABLE IF NOT EXISTS past_proposal_index (
+    id              TEXT PRIMARY KEY,
+    folder_name     TEXT NOT NULL UNIQUE,
+    tender_number   TEXT DEFAULT '',
+    title           TEXT NOT NULL DEFAULT '',
+    client          TEXT DEFAULT '',
+    sector          TEXT DEFAULT '',
+    country         TEXT DEFAULT '',
+    technical_summary TEXT DEFAULT '',
+    pricing_summary TEXT DEFAULT '',
+    total_price     REAL DEFAULT 0.0,
+    margin_info     TEXT DEFAULT '',
+    technologies    TEXT DEFAULT '[]',
+    keywords        TEXT DEFAULT '[]',
+    full_summary    TEXT DEFAULT '',
+    file_count      INTEGER DEFAULT 0,
+    file_list       TEXT DEFAULT '[]',
+    indexed_at      TEXT DEFAULT (datetime('now')),
+    updated_at      TEXT DEFAULT (datetime('now'))
+);
+
+-- FTS5 virtual table for full-text search over past proposals
+CREATE VIRTUAL TABLE IF NOT EXISTS past_proposal_fts USING fts5(
+    title,
+    client,
+    sector,
+    country,
+    technical_summary,
+    pricing_summary,
+    technologies,
+    keywords,
+    full_summary,
+    content='past_proposal_index',
+    content_rowid='rowid',
+    tokenize='porter unicode61'
+);
+
+-- Triggers to keep FTS5 in sync with the main table
+CREATE TRIGGER IF NOT EXISTS past_proposal_fts_insert
+AFTER INSERT ON past_proposal_index BEGIN
+    INSERT INTO past_proposal_fts(rowid, title, client, sector, country,
+        technical_summary, pricing_summary, technologies, keywords, full_summary)
+    VALUES (NEW.rowid, NEW.title, NEW.client, NEW.sector, NEW.country,
+        NEW.technical_summary, NEW.pricing_summary, NEW.technologies,
+        NEW.keywords, NEW.full_summary);
+END;
+
+CREATE TRIGGER IF NOT EXISTS past_proposal_fts_update
+AFTER UPDATE ON past_proposal_index BEGIN
+    INSERT INTO past_proposal_fts(past_proposal_fts, rowid, title, client, sector,
+        country, technical_summary, pricing_summary, technologies, keywords, full_summary)
+    VALUES ('delete', OLD.rowid, OLD.title, OLD.client, OLD.sector, OLD.country,
+        OLD.technical_summary, OLD.pricing_summary, OLD.technologies,
+        OLD.keywords, OLD.full_summary);
+    INSERT INTO past_proposal_fts(rowid, title, client, sector, country,
+        technical_summary, pricing_summary, technologies, keywords, full_summary)
+    VALUES (NEW.rowid, NEW.title, NEW.client, NEW.sector, NEW.country,
+        NEW.technical_summary, NEW.pricing_summary, NEW.technologies,
+        NEW.keywords, NEW.full_summary);
+END;
+
+CREATE TRIGGER IF NOT EXISTS past_proposal_fts_delete
+AFTER DELETE ON past_proposal_index BEGIN
+    INSERT INTO past_proposal_fts(past_proposal_fts, rowid, title, client, sector,
+        country, technical_summary, pricing_summary, technologies, keywords, full_summary)
+    VALUES ('delete', OLD.rowid, OLD.title, OLD.client, OLD.sector, OLD.country,
+        OLD.technical_summary, OLD.pricing_summary, OLD.technologies,
+        OLD.keywords, OLD.full_summary);
+END;

@@ -5,11 +5,13 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
+from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
 
 from app.db.database import Database
 from app.services.docwriter import DocWriterService
+from app.services.embeddings import EmbeddingService
 from app.services.llm import LLMService
 from app.services.parser import ParserService
 
@@ -52,6 +54,7 @@ def register_technical_tools(
     docwriter: DocWriterService,
     data_dir: Path,
     company_name: str,
+    embeddings: Optional[EmbeddingService] = None,
 ) -> None:
     """Register all technical proposal tools on the MCP server."""
 
@@ -124,13 +127,66 @@ def register_technical_tools(
         if template_path.exists():
             docs.append(f"Template for {section_name}:\n{template_path.read_text()}")
 
-        # Check for relevant past proposals (PDF, DOCX, XLSX, MD, TXT)
+        # Check for relevant past proposals — prefer hybrid/FTS5 index, fall back to filesystem
+        try:
+            search_terms = []
+            if rfp:
+                if rfp.get("title"):
+                    search_terms.append(rfp["title"])
+                if rfp.get("sector"):
+                    search_terms.append(rfp["sector"])
+                if rfp.get("client"):
+                    search_terms.append(rfp["client"])
+            search_query = " ".join(search_terms)
+
+            if search_query:
+                # Try vector search first for semantic matching
+                matches = []
+                if embeddings and db.vec_enabled:
+                    try:
+                        query_vec = await embeddings.embed_query(search_query)
+                        matches = await db.search_proposal_vector(query_vec, limit=3)
+                        if matches:
+                            logger.debug("Loaded %d past proposals via vector search", len(matches))
+                    except Exception as e:
+                        logger.debug("Vector search failed: %s", e)
+
+                # Fall back to FTS5 if vector returned nothing
+                if not matches:
+                    matches = await db.search_proposal_index(search_query, limit=3)
+                    if matches:
+                        logger.debug("Loaded %d past proposals via FTS5 search", len(matches))
+
+                if matches:
+                    for m in matches:
+                        summary = m.get("technical_summary", "")
+                        if summary:
+                            techs = ", ".join(m.get("technologies", [])[:10])
+                            docs.append(
+                                f"Past proposal reference ({m.get('folder_name', '')}):\n"
+                                f"Title: {m.get('title', '')}\n"
+                                f"Client: {m.get('client', '')} | Sector: {m.get('sector', '')}\n"
+                                f"Technologies: {techs}\n\n"
+                                f"{summary[:3000]}"
+                            )
+                    return docs
+        except Exception as e:
+            logger.debug("Index search failed, falling back to filesystem: %s", e)
+
+        # Fallback: filesystem scan
         past_dir = data_dir / "past_proposals"
         section_key = section_name.lower().replace(" ", "_")
         if past_dir.exists():
             for proposal_dir in sorted(past_dir.iterdir()):
                 if proposal_dir.is_dir():
-                    # First: look for a file matching this section name
+                    # Check for _summary.md first (from indexing)
+                    summary_file = proposal_dir / "_summary.md"
+                    if summary_file.exists():
+                        content = summary_file.read_text()
+                        docs.append(f"Past proposal reference ({proposal_dir.name}):\n{content[:3000]}")
+                        continue
+
+                    # Original logic: look for a file matching this section name
                     matched = False
                     for f in sorted(proposal_dir.iterdir()):
                         if f.suffix.lower() in PAST_PROPOSAL_EXTENSIONS and section_key in f.name.lower():
@@ -140,16 +196,13 @@ def register_technical_tools(
                                 matched = True
                                 break
 
-                    # If no section-specific match, use full proposal files as general context
-                    # (only for Company Profile and Past Successful Projects sections
-                    # which benefit from seeing the whole prior submission)
                     if not matched and section_key in ("company_profile", "past_successful_projects"):
                         for f in sorted(proposal_dir.iterdir()):
                             if f.suffix.lower() in PAST_PROPOSAL_EXTENSIONS:
                                 content = await _read_past_proposal_file(f)
                                 if content:
                                     docs.append(f"Past submission ({proposal_dir.name}/{f.name}):\n{content[:4000]}")
-                                    break  # One file per past proposal directory
+                                    break
 
         return docs
 

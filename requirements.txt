@@ -6,6 +6,10 @@ anthropic>=0.42.0
 
 # Database
 aiosqlite>=0.20.0
+sqlite-vec>=0.1.6
+
+# Embeddings (optional — enables vector search)
+voyageai>=0.3.0
 
 # Document parsing
 pdfplumber>=0.11.0

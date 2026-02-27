@@ -34,7 +34,7 @@ def build_server(settings: Settings) -> tuple[FastMCP, Database]:
     )
 
     # --- Database ---
-    db = Database(settings.abs_database_path())
+    db = Database(settings.abs_database_path(), embedding_dimensions=settings.embedding_dimensions)
 
     # --- Services ---
     llm = LLMService(
@@ -61,18 +61,34 @@ def build_server(settings: Settings) -> tuple[FastMCP, Database]:
     # --- Register Tools ---
     from app.tools.document import register_document_tools
     from app.tools.financial import register_financial_tools
+    from app.tools.indexing import register_indexing_tools
     from app.tools.partners import register_partner_tools
     from app.tools.technical import register_technical_tools
 
     data_dir = settings.abs_data_dir()
 
     register_document_tools(mcp, db, llm, parser, docwriter, data_dir)
-    register_technical_tools(mcp, db, llm, parser, docwriter, data_dir, settings.company_name)
+
+    # --- Embeddings (optional) ---
+    embeddings = None
+    if settings.voyage_api_key:
+        from app.services.embeddings import EmbeddingService
+        embeddings = EmbeddingService(
+            api_key=settings.voyage_api_key,
+            model=settings.embedding_model,
+            dimensions=settings.embedding_dimensions,
+        )
+        logger.info("Voyage AI embeddings enabled — model=%s, dim=%d", settings.embedding_model, settings.embedding_dimensions)
+    else:
+        logger.info("VOYAGE_API_KEY not set — vector search disabled, using FTS5 only")
+
+    register_technical_tools(mcp, db, llm, parser, docwriter, data_dir, settings.company_name, embeddings=embeddings)
     register_financial_tools(
         mcp, db, llm, parser, docwriter, data_dir,
         settings.default_currency, settings.default_margin_pct,
     )
     register_partner_tools(mcp, db, llm, data_dir)
+    register_indexing_tools(mcp, db, llm, parser, data_dir, embeddings=embeddings)
 
     # --- Register Resources ---
     from app.resources.knowledge import register_resources
@@ -96,11 +112,28 @@ async def _run(settings: Settings) -> None:
     try:
         if settings.transport == "http":
             logger.info("Starting HTTP transport on %s:%d", settings.host, settings.port)
-            await mcp.run_async(
-                transport="streamable-http",
-                host=settings.host,
-                port=settings.port,
-            )
+
+            if settings.mcp_api_key:
+                # Wrap the Starlette app with Bearer token auth
+                import uvicorn
+                from app.middleware.auth import BearerTokenMiddleware
+
+                app = mcp.streamable_http_app()
+                app = BearerTokenMiddleware(app, settings.mcp_api_key)
+                logger.info("Bearer token authentication enabled")
+
+                config = uvicorn.Config(
+                    app, host=settings.host, port=settings.port, log_level="info",
+                )
+                server = uvicorn.Server(config)
+                await server.serve()
+            else:
+                logger.warning("MCP_API_KEY not set — running without authentication")
+                await mcp.run_async(
+                    transport="streamable-http",
+                    host=settings.host,
+                    port=settings.port,
+                )
         else:
             logger.info("Starting stdio transport")
             await mcp.run_async(transport="stdio")
