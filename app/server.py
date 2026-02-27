@@ -61,7 +61,9 @@ def build_server(settings: Settings) -> tuple[FastMCP, Database]:
     # --- OAuth 2.0 (for claude.ai integration) ---
     oauth_provider = None
     if settings.oauth_issuer_url:
+        from urllib.parse import urlparse as _urlparse
         from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
+        from mcp.server.transport_security import TransportSecuritySettings
         from app.middleware.oauth import TenderAIOAuthProvider
 
         oauth_provider = TenderAIOAuthProvider(db)
@@ -75,6 +77,15 @@ def build_server(settings: Settings) -> tuple[FastMCP, Database]:
         )
         mcp_kwargs["auth_server_provider"] = oauth_provider
         mcp_kwargs["auth"] = auth_settings
+
+        # Allow the public hostname through DNS rebinding protection
+        parsed_issuer = _urlparse(settings.oauth_issuer_url)
+        hostname = parsed_issuer.hostname or "localhost"
+        mcp_kwargs["transport_security"] = TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=[hostname, f"{hostname}:*"],
+            allowed_origins=[f"https://{hostname}", f"https://{hostname}:*"],
+        )
         logger.info("OAuth 2.0 enabled — issuer: %s", settings.oauth_issuer_url)
 
     mcp = FastMCP(**mcp_kwargs)
