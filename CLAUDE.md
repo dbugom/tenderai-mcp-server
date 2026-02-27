@@ -2,7 +2,7 @@
 
 ## What This Is
 
-TenderAI is a FastMCP server for tender/proposal management. It provides MCP tools that Claude uses to parse RFPs, write technical and financial proposals, coordinate with partners, and search past proposals.
+TenderAI is a FastMCP server for tender/proposal management. It provides MCP tools that Claude uses to parse RFPs, write technical and financial proposals, coordinate with partners, and search past proposals. Supports both Bearer token auth (for Claude Code/Desktop) and OAuth 2.0 (for claude.ai).
 
 ## Running the Server
 
@@ -34,21 +34,22 @@ app/
 │   ├── embeddings.py      # Voyage AI async wrapper for vector embeddings
 │   └── docwriter.py       # DOCX/XLSX document generation
 ├── db/
-│   ├── schema.sql         # 7 tables + FTS5 virtual table + 3 sync triggers
-│   ├── database.py        # Async SQLite layer + sqlite-vec extension + vector methods
+│   ├── schema.sql         # 10 tables + FTS5 virtual table + 3 sync triggers
+│   ├── database.py        # Async SQLite layer + sqlite-vec + vector methods + OAuth CRUD
 │   └── models.py          # Pydantic models for all entities
 ├── resources/
 │   └── knowledge.py       # 5 MCP resource URI handlers
 ├── prompts/
 │   └── workflows.py       # 4 workflow prompts
 └── middleware/
-    └── auth.py            # ASGI Bearer token auth middleware
+    ├── auth.py            # ASGI Bearer token auth (Claude Code/Desktop)
+    └── oauth.py           # OAuth 2.0 provider (claude.ai integration)
 ```
 
 ## Database
 
 - SQLite at `db/tenderai.db` (WAL mode, auto-created on startup)
-- 7 tables: rfp, proposal, vendor, bom, partner, partner_deliverable, past_proposal_index
+- 10 tables: rfp, proposal, vendor, bom, partner, partner_deliverable, past_proposal_index, oauth_client, oauth_auth_code, oauth_token
 - FTS5 virtual table: `past_proposal_fts` (keyword search with BM25 + porter stemming)
 - vec0 virtual table: `past_proposal_vec` (vector similarity search via sqlite-vec)
 - Schema runs on every startup via `CREATE TABLE IF NOT EXISTS` — no migrations needed
@@ -75,13 +76,23 @@ Set `VOYAGE_API_KEY` in `.env` to enable vector search. Without it, FTS5 keyword
 - Past proposal files go in `data/past_proposals/{folder_name}/`
 - Generated output goes to `data/generated_proposals/`
 
+## Authentication
+
+Two auth modes for HTTP transport (selected automatically based on config):
+
+1. **OAuth 2.0** (for claude.ai): Set `OAUTH_ISSUER_URL` — enables Dynamic Client Registration + Authorization Code + PKCE. Auto-approves all requests (single-user server). MCP SDK handles all endpoints (`/authorize`, `/token`, `/register`, `/.well-known/*`).
+2. **Bearer token** (for Claude Code/Desktop): Set `MCP_API_KEY` — static token in `Authorization: Bearer <token>` header.
+
+OAuth takes precedence when both are set. The OAuth provider is in `app/middleware/oauth.py`, backed by 3 SQLite tables (`oauth_client`, `oauth_auth_code`, `oauth_token`).
+
 ## Configuration
 
 All settings via `.env` (see `.env.example`). Key vars:
 - `ANTHROPIC_API_KEY` — required for LLM
 - `VOYAGE_API_KEY` — optional, enables vector search
 - `TRANSPORT` — `stdio` (default) or `http`
-- `MCP_API_KEY` — required for HTTP transport auth
+- `MCP_API_KEY` — Bearer token auth for HTTP transport
+- `OAUTH_ISSUER_URL` — public HTTPS URL to enable OAuth 2.0 (e.g., `https://tender.yfi.ae`)
 - `COMPANY_NAME` — used in proposal generation
 
 ## Dependencies

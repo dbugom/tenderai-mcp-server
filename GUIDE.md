@@ -453,10 +453,13 @@ The script will:
 sudo nano /opt/tenderai/.env
 ```
 
-Set your Anthropic API key:
+Set your keys:
 ```ini
 ANTHROPIC_API_KEY=sk-ant-api03-your-actual-key-here
 COMPANY_NAME=Your Company Name LLC
+
+# Enable OAuth 2.0 for claude.ai (optional — set to your public HTTPS URL)
+OAUTH_ISSUER_URL=https://tender.yfi.ae
 ```
 
 ### Step 4: Upload Your Knowledge Base
@@ -492,7 +495,7 @@ sudo journalctl -u tenderai -f
 
 ---
 
-## 5. Connecting to Claude Desktop / Claude Code
+## 5. Connecting to Claude Desktop / Claude Code / Claude.ai
 
 ### Option A: Local stdio (Development)
 
@@ -514,7 +517,7 @@ or Claude Code config:
 }
 ```
 
-### Option B: Remote HTTP (Production)
+### Option B: Remote HTTP with Bearer Token (Claude Code / Claude Desktop)
 
 ```json
 {
@@ -532,6 +535,41 @@ or Claude Code config:
 
 Replace `YOUR_MCP_API_KEY_HERE` with the key generated during setup (or the
 value you set in `.env`).
+
+### Option C: Claude.ai (OAuth 2.0)
+
+Claude.ai requires OAuth 2.0 — it cannot use static Bearer tokens. TenderAI
+supports this natively when `OAUTH_ISSUER_URL` is set.
+
+**Server setup:**
+
+1. Set `OAUTH_ISSUER_URL=https://tender.yfi.ae` in `.env`
+2. Ensure nginx proxies the OAuth endpoints (see below)
+3. Restart: `sudo systemctl restart tenderai`
+
+**Nginx must proxy these paths** (in addition to `/mcp`):
+
+```
+/.well-known/oauth-authorization-server
+/.well-known/oauth-protected-resource
+/authorize
+/token
+/register
+/revoke
+```
+
+**Connect on claude.ai:**
+
+1. Go to Settings → Integrations → Add
+2. Enter URL: `https://tender.yfi.ae/mcp`
+3. Claude.ai automatically completes the OAuth flow (Dynamic Client Registration + PKCE)
+4. TenderAI auto-approves — no login page needed
+
+**How it works:** Claude.ai discovers the OAuth endpoints via
+`/.well-known/oauth-authorization-server`, registers as a client, obtains an
+authorization code (auto-approved), exchanges it for access/refresh tokens, and
+uses the access token for all subsequent MCP requests. Token refresh happens
+automatically when tokens expire.
 
 After adding the config, restart Claude Desktop / Claude Code. You should see
 TenderAI tools available.
@@ -868,6 +906,23 @@ ls -la data/generated_proposals/
 ```bash
 rm db/tenderai.db
 # The database is recreated automatically on next server start
+```
+
+### Claude.ai OAuth connection fails
+
+```bash
+# Check server logs for the OAuth flow
+sudo journalctl -u tenderai -n 30
+
+# Verify metadata endpoint is reachable
+curl https://tender.yfi.ae/.well-known/oauth-authorization-server
+
+# If 404: nginx isn't proxying OAuth endpoints — add location blocks for:
+# /.well-known/oauth-authorization-server, /.well-known/oauth-protected-resource,
+# /authorize, /token, /register, /revoke
+
+# If "Invalid Host header" / 421 Misdirected: the MCP SDK's DNS rebinding
+# protection is rejecting the hostname. Ensure OAUTH_ISSUER_URL matches your domain.
 ```
 
 ### SSL certificate renewal (production)

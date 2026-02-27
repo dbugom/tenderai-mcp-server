@@ -12,6 +12,7 @@ A production-ready [Model Context Protocol](https://modelcontextprotocol.io/) se
 - **Voyage AI Embeddings** (optional): Semantic search over past proposals — finds similar projects even without exact keyword matches
 - **Document Generation**: Professional DOCX proposals and XLSX BOM spreadsheets
 - **SQLite Database**: Tracks RFPs, proposals, vendors, BOM items, partners, deliverables, and indexed past proposals
+- **OAuth 2.0**: Built-in OAuth support for claude.ai integration (Dynamic Client Registration + PKCE, auto-approve)
 
 ## Quick Start
 
@@ -49,7 +50,7 @@ python -m app.server
 }
 ```
 
-**HTTP (remote):**
+**HTTP (remote — Claude Code/Desktop):**
 ```json
 {
   "mcpServers": {
@@ -63,6 +64,10 @@ python -m app.server
   }
 }
 ```
+
+**Claude.ai (OAuth 2.0):**
+
+Set `OAUTH_ISSUER_URL=https://tender.yfi.ae` in `.env`, then add `https://tender.yfi.ae/mcp` as an integration on claude.ai. OAuth flow completes automatically.
 
 ### Production Deployment
 
@@ -201,8 +206,8 @@ app/
 ├── prompts/
 │   └── workflows.py       # 4 workflow prompts
 ├── db/
-│   ├── schema.sql         # SQLite schema (7 tables + FTS5 + triggers)
-│   ├── database.py        # Async database layer + sqlite-vec vector search
+│   ├── schema.sql         # SQLite schema (10 tables + FTS5 + triggers)
+│   ├── database.py        # Async database layer + sqlite-vec + OAuth CRUD
 │   └── models.py          # Pydantic models
 ├── services/
 │   ├── llm.py             # Anthropic SDK wrapper (15 prompt templates)
@@ -210,5 +215,6 @@ app/
 │   ├── embeddings.py      # Voyage AI embedding service (optional)
 │   └── docwriter.py       # DOCX/XLSX generator
 └── middleware/
-    └── auth.py            # ASGI Bearer token auth
+    ├── auth.py            # ASGI Bearer token auth (Claude Code/Desktop)
+    └── oauth.py           # OAuth 2.0 provider (claude.ai)
 ```
