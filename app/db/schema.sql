@@ -172,3 +172,39 @@ AFTER DELETE ON past_proposal_index BEGIN
         OLD.technical_summary, OLD.pricing_summary, OLD.technologies,
         OLD.keywords, OLD.full_summary);
 END;
+
+-- OAuth 2.0 tables (Dynamic Client Registration, Authorization Codes, Tokens)
+
+CREATE TABLE IF NOT EXISTS oauth_client (
+    client_id       TEXT PRIMARY KEY,
+    client_secret   TEXT NOT NULL,
+    redirect_uris   TEXT NOT NULL DEFAULT '[]',
+    client_name     TEXT DEFAULT '',
+    grant_types     TEXT DEFAULT '["authorization_code"]',
+    response_types  TEXT DEFAULT '["code"]',
+    scope           TEXT DEFAULT '',
+    token_endpoint_auth_method TEXT DEFAULT 'client_secret_post',
+    created_at      TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS oauth_auth_code (
+    code            TEXT PRIMARY KEY,
+    client_id       TEXT NOT NULL,
+    redirect_uri    TEXT NOT NULL,
+    redirect_uri_provided_explicitly INTEGER DEFAULT 1,
+    scope           TEXT DEFAULT '',
+    code_challenge  TEXT NOT NULL,
+    resource        TEXT DEFAULT '',
+    expires_at      REAL NOT NULL,
+    created_at      TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS oauth_token (
+    token           TEXT PRIMARY KEY,
+    token_type      TEXT NOT NULL CHECK(token_type IN ('access','refresh')),
+    client_id       TEXT NOT NULL,
+    scope           TEXT DEFAULT '',
+    resource        TEXT DEFAULT '',
+    expires_at      INTEGER,
+    created_at      TEXT DEFAULT (datetime('now'))
+);

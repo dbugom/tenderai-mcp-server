@@ -542,6 +542,86 @@ class Database:
         return True
 
     # ------------------------------------------------------------------
+    # OAuth
+    # ------------------------------------------------------------------
+
+    async def save_oauth_client(
+        self,
+        client_id: str,
+        client_secret: str,
+        redirect_uris: str = "[]",
+        client_name: str = "",
+        grant_types: str = '["authorization_code"]',
+        response_types: str = '["code"]',
+        scope: str = "",
+        token_endpoint_auth_method: str = "client_secret_post",
+    ) -> None:
+        await self._execute(
+            "INSERT OR REPLACE INTO oauth_client "
+            "(client_id, client_secret, redirect_uris, client_name, "
+            "grant_types, response_types, scope, token_endpoint_auth_method) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (client_id, client_secret, redirect_uris, client_name,
+             grant_types, response_types, scope, token_endpoint_auth_method),
+        )
+
+    async def get_oauth_client(self, client_id: str) -> Optional[dict]:
+        return await self._fetchone(
+            "SELECT * FROM oauth_client WHERE client_id=?", (client_id,)
+        )
+
+    async def save_oauth_auth_code(
+        self,
+        code: str,
+        client_id: str,
+        redirect_uri: str,
+        code_challenge: str,
+        expires_at: float,
+        redirect_uri_provided_explicitly: bool = True,
+        scope: str = "",
+        resource: str = "",
+    ) -> None:
+        await self._execute(
+            "INSERT INTO oauth_auth_code "
+            "(code, client_id, redirect_uri, code_challenge, expires_at, "
+            "redirect_uri_provided_explicitly, scope, resource) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (code, client_id, redirect_uri, code_challenge, expires_at,
+             1 if redirect_uri_provided_explicitly else 0, scope, resource),
+        )
+
+    async def get_and_delete_oauth_auth_code(self, code: str) -> Optional[dict]:
+        row = await self._fetchone(
+            "SELECT * FROM oauth_auth_code WHERE code=?", (code,)
+        )
+        if row:
+            await self._execute("DELETE FROM oauth_auth_code WHERE code=?", (code,))
+        return row
+
+    async def save_oauth_token(
+        self,
+        token: str,
+        token_type: str,
+        client_id: str,
+        scope: str = "",
+        resource: str = "",
+        expires_at: Optional[int] = None,
+    ) -> None:
+        await self._execute(
+            "INSERT INTO oauth_token (token, token_type, client_id, scope, resource, expires_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (token, token_type, client_id, scope, resource, expires_at),
+        )
+
+    async def get_oauth_token(self, token: str) -> Optional[dict]:
+        return await self._fetchone(
+            "SELECT * FROM oauth_token WHERE token=?", (token,)
+        )
+
+    async def delete_oauth_token(self, token: str) -> None:
+        await self._execute("DELETE FROM oauth_token WHERE token=?", (token,))
+
+    # ------------------------------------------------------------------
     # Past Proposal Vectors (sqlite-vec)
     # ------------------------------------------------------------------
 

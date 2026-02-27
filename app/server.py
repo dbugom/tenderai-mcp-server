@@ -48,8 +48,8 @@ def build_server(settings: Settings) -> tuple[FastMCP, Database]:
     )
 
     # --- MCP Server ---
-    mcp = FastMCP(
-        "TenderAI",
+    mcp_kwargs: dict = dict(
+        name="TenderAI",
         instructions=(
             "TenderAI is a tender/proposal management system. Use its tools to parse RFP documents, "
             "write technical and financial proposals, coordinate with partners, and track compliance. "
@@ -57,6 +57,27 @@ def build_server(settings: Settings) -> tuple[FastMCP, Database]:
             "writing tools to build the proposal."
         ),
     )
+
+    # --- OAuth 2.0 (for claude.ai integration) ---
+    oauth_provider = None
+    if settings.oauth_issuer_url:
+        from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
+        from app.middleware.oauth import TenderAIOAuthProvider
+
+        oauth_provider = TenderAIOAuthProvider(db)
+        # resource_server_url is the MCP endpoint URL
+        resource_url = settings.oauth_issuer_url.rstrip("/") + "/mcp"
+        auth_settings = AuthSettings(
+            issuer_url=settings.oauth_issuer_url,
+            resource_server_url=resource_url,
+            client_registration_options=ClientRegistrationOptions(enabled=True),
+            revocation_options=RevocationOptions(enabled=True),
+        )
+        mcp_kwargs["auth_server_provider"] = oauth_provider
+        mcp_kwargs["auth"] = auth_settings
+        logger.info("OAuth 2.0 enabled — issuer: %s", settings.oauth_issuer_url)
+
+    mcp = FastMCP(**mcp_kwargs)
 
     # --- Register Tools ---
     from app.tools.document import register_document_tools
@@ -113,8 +134,20 @@ async def _run(settings: Settings) -> None:
         if settings.transport == "http":
             logger.info("Starting HTTP transport on %s:%d", settings.host, settings.port)
 
-            if settings.mcp_api_key:
-                # Wrap the Starlette app with Bearer token auth
+            if settings.oauth_issuer_url:
+                # OAuth 2.0 — FastMCP handles all auth routes internally
+                import uvicorn
+
+                app = mcp.streamable_http_app()
+                logger.info("OAuth 2.0 auth active — FastMCP manages /authorize, /token, /register")
+
+                config = uvicorn.Config(
+                    app, host=settings.host, port=settings.port, log_level="info",
+                )
+                server = uvicorn.Server(config)
+                await server.serve()
+            elif settings.mcp_api_key:
+                # Static Bearer token auth (for Claude Code / direct API access)
                 import uvicorn
                 from app.middleware.auth import BearerTokenMiddleware
 
@@ -128,7 +161,7 @@ async def _run(settings: Settings) -> None:
                 server = uvicorn.Server(config)
                 await server.serve()
             else:
-                logger.warning("MCP_API_KEY not set — running without authentication")
+                logger.warning("No auth configured — running without authentication")
                 await mcp.run_async(
                     transport="streamable-http",
                     host=settings.host,

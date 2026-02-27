@@ -23,6 +23,7 @@ class Settings:
 
     # Auth
     mcp_api_key: str = ""
+    oauth_issuer_url: str = ""
 
     # LLM
     anthropic_api_key: str = ""
@@ -70,6 +71,7 @@ def load_settings() -> Settings:
         host=os.getenv("HOST", "0.0.0.0"),
         port=int(os.getenv("PORT", "8000")),
         mcp_api_key=os.getenv("MCP_API_KEY", ""),
+        oauth_issuer_url=os.getenv("OAUTH_ISSUER_URL", ""),
         anthropic_api_key=os.getenv("ANTHROPIC_API_KEY", ""),
         llm_model=os.getenv("LLM_MODEL", "claude-sonnet-4-5-20241022"),
         llm_max_tokens=int(os.getenv("LLM_MAX_TOKENS", "4096")),
