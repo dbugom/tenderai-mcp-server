@@ -4,6 +4,11 @@ Supports two search modes:
 - FTS5: keyword search with BM25 ranking (always available)
 - Hybrid: FTS5 + vector similarity via sqlite-vec + Voyage AI embeddings,
   combined with Reciprocal Rank Fusion (enabled when VOYAGE_API_KEY is set)
+
+Supports two indexing modes:
+- With ANTHROPIC_API_KEY: server-side LLM extracts structured metadata automatically
+- Without ANTHROPIC_API_KEY (data-tool pattern): parses files and returns raw text
+  for Claude to analyze, then saves via save_proposal_index tool
 """
 
 from __future__ import annotations
@@ -25,7 +30,7 @@ logger = logging.getLogger(__name__)
 # File extensions we can parse
 INDEXABLE_EXTENSIONS = {".pdf", ".docx", ".doc", ".xlsx", ".xls", ".md", ".txt"}
 
-# Budget for combined text sent to LLM
+# Budget for combined text sent to LLM / returned to Claude
 MAX_TOTAL_CHARS = 25_000
 FINANCIAL_RESERVE_CHARS = 8_000
 
@@ -69,7 +74,7 @@ def _rrf_combine(
 def register_indexing_tools(
     mcp: FastMCP,
     db: Database,
-    llm: LLMService,
+    llm: Optional[LLMService],
     parser: ParserService,
     data_dir: Path,
     embeddings: Optional[EmbeddingService] = None,
@@ -77,6 +82,19 @@ def register_indexing_tools(
     """Register past proposal indexing and search tools on the MCP server."""
 
     past_dir = data_dir / "past_proposals"
+
+    # Check if LLM is usable (has API key)
+    has_llm = llm is not None and bool(getattr(llm, 'client', None))
+    try:
+        if has_llm and not llm.client.api_key:
+            has_llm = False
+    except Exception:
+        pass
+
+    if has_llm:
+        logger.info("Indexing tools: LLM available — server-side extraction enabled")
+    else:
+        logger.info("Indexing tools: No LLM — data-tool mode (Claude does analysis)")
 
     async def _read_file(file_path: Path) -> str:
         """Read a single file, using parser for binary formats."""
@@ -92,9 +110,8 @@ def register_indexing_tools(
                 return ""
         return ""
 
-    async def _index_single_folder(folder_name: str, folder_path: Path) -> dict:
-        """Index a single proposal folder (internal helper)."""
-        # Collect all parseable files, skipping _-prefixed files
+    async def _parse_folder_files(folder_name: str, folder_path: Path) -> dict:
+        """Parse all files in a folder and return combined text + file list."""
         files = sorted(
             f for f in folder_path.iterdir()
             if f.is_file()
@@ -105,7 +122,7 @@ def register_indexing_tools(
             raise ValueError(f"No parseable files found in {folder_path}")
 
         file_list = [f.name for f in files]
-        logger.info("Indexing %d files from %s", len(files), folder_name)
+        logger.info("Parsing %d files from %s", len(files), folder_name)
 
         # Parse files, separating financial (XLSX) from others
         financial_texts = []
@@ -135,35 +152,21 @@ def register_indexing_tools(
         if financial_combined:
             combined_text += "\n\n--- FINANCIAL DATA ---\n\n" + financial_combined
 
-        # Call LLM for structured extraction
-        user_prompt = (
-            f"Analyze the following past proposal documents from folder '{folder_name}' "
-            f"and extract structured metadata.\n\n"
-            f"Files: {', '.join(file_list)}\n\n"
-            f"{combined_text}"
-        )
+        return {
+            "folder_name": folder_name,
+            "file_list": file_list,
+            "file_count": len(files),
+            "combined_text": combined_text,
+        }
 
-        raw_response = await llm.generate_section(
-            "proposal_summary", user_prompt, max_tokens=4096
-        )
-
-        # Parse JSON response (handle ```json blocks)
-        json_text = raw_response.strip()
-        if json_text.startswith("```"):
-            # Remove opening ```json or ``` and closing ```
-            lines = json_text.split("\n")
-            lines = [l for l in lines if not l.strip().startswith("```")]
-            json_text = "\n".join(lines)
-
-        try:
-            extracted = json.loads(json_text)
-        except json.JSONDecodeError:
-            logger.error("LLM returned invalid JSON for %s: %s", folder_name, json_text[:200])
-            extracted = {
-                "title": folder_name,
-                "full_summary": raw_response[:1000],
-            }
-
+    async def _save_extracted(
+        folder_name: str,
+        folder_path: Path,
+        extracted: dict,
+        file_count: int,
+        file_list: list[str],
+    ) -> dict:
+        """Save extracted metadata to DB, write _summary.md, generate embedding."""
         # Build _summary.md for human readability
         summary_md = (
             f"# {extracted.get('title', folder_name)}\n\n"
@@ -200,7 +203,7 @@ def register_indexing_tools(
             technologies=extracted.get("technologies", []),
             keywords=extracted.get("keywords", []),
             full_summary=extracted.get("full_summary", ""),
-            file_count=len(files),
+            file_count=file_count,
             file_list=file_list,
         )
 
@@ -231,11 +234,48 @@ def register_indexing_tools(
             "title": index_record.get("title", ""),
             "client": index_record.get("client", ""),
             "sector": index_record.get("sector", ""),
-            "file_count": len(files),
+            "file_count": file_count,
             "technologies": index_record.get("technologies", []),
             "summary_path": str(summary_path),
             "vector_indexed": vector_stored,
         }
+
+    async def _index_single_folder_with_llm(folder_name: str, folder_path: Path) -> dict:
+        """Index a single proposal folder using server-side LLM extraction."""
+        parsed = await _parse_folder_files(folder_name, folder_path)
+
+        # Call LLM for structured extraction
+        user_prompt = (
+            f"Analyze the following past proposal documents from folder '{folder_name}' "
+            f"and extract structured metadata.\n\n"
+            f"Files: {', '.join(parsed['file_list'])}\n\n"
+            f"{parsed['combined_text']}"
+        )
+
+        raw_response = await llm.generate_section(
+            "proposal_summary", user_prompt, max_tokens=4096
+        )
+
+        # Parse JSON response (handle ```json blocks)
+        json_text = raw_response.strip()
+        if json_text.startswith("```"):
+            lines = json_text.split("\n")
+            lines = [l for l in lines if not l.strip().startswith("```")]
+            json_text = "\n".join(lines)
+
+        try:
+            extracted = json.loads(json_text)
+        except json.JSONDecodeError:
+            logger.error("LLM returned invalid JSON for %s: %s", folder_name, json_text[:200])
+            extracted = {
+                "title": folder_name,
+                "full_summary": raw_response[:1000],
+            }
+
+        return await _save_extracted(
+            folder_name, folder_path, extracted,
+            parsed["file_count"], parsed["file_list"],
+        )
 
     @mcp.tool()
     async def index_past_proposal(
@@ -243,16 +283,17 @@ def register_indexing_tools(
         batch_size: int = 10,
         skip_already_indexed: bool = True,
     ) -> dict:
-        """Parse all files in a past proposal folder, extract structured metadata via LLM, and index for fast search.
+        """Parse all files in a past proposal folder and index for fast search.
 
-        Scans the folder, parses all supported files (PDF, DOCX, XLSX, MD, TXT),
-        sends combined content to the LLM for structured extraction, saves a
-        human-readable _summary.md file, and upserts the index into the database
-        for FTS5 full-text search.
+        Scans the folder, parses all supported files (PDF, DOCX, XLSX, MD, TXT).
+
+        If the server has ANTHROPIC_API_KEY configured, extraction happens automatically.
+        Otherwise, returns the parsed text for each folder so you (Claude) can analyze it
+        and call save_proposal_index to store the structured metadata.
 
         Supports nested folders: if the folder contains subdirectories instead of
-        parseable files, each subdirectory is indexed as a separate proposal.
-        For example, folder_name="TRA" will index all subfolders inside TRA/.
+        parseable files, each subdirectory is processed as a separate proposal.
+        For example, folder_name="TRA" will process all subfolders inside TRA/.
 
         For large parent folders, processes in batches. Call this tool repeatedly
         with the same folder_name until progress shows 100% complete.
@@ -267,8 +308,10 @@ def register_indexing_tools(
                                   (default True). Set to False to re-index all.
 
         Returns:
-            Dict with index_id, folder_name, title, client, sector, file_count, and technologies.
-            If the folder contains subfolders, returns a batch result with progress info.
+            If server has LLM: indexed results with metadata.
+            If no LLM: parsed text data for each folder — call save_proposal_index
+            with your analysis for each folder to complete indexing.
+            Batch results include progress_percent and remaining count.
         """
         folder_path = past_dir / folder_name
         if not folder_path.exists() or not folder_path.is_dir():
@@ -277,7 +320,7 @@ def register_indexing_tools(
                 f"Expected a directory inside data/past_proposals/"
             )
 
-        # Check if folder has parseable files directly
+        # Check if folder has parseable files directly (single proposal)
         direct_files = [
             f for f in folder_path.iterdir()
             if f.is_file()
@@ -285,11 +328,23 @@ def register_indexing_tools(
             and not f.name.startswith("_")
         ]
 
-        # If it has parseable files, index it as a single proposal
         if direct_files:
-            return await _index_single_folder(folder_name, folder_path)
+            # Single proposal folder
+            if has_llm:
+                return await _index_single_folder_with_llm(folder_name, folder_path)
+            else:
+                parsed = await _parse_folder_files(folder_name, folder_path)
+                return {
+                    "mode": "data_tool",
+                    "needs_save": True,
+                    "message": (
+                        "Parsed files successfully. Analyze the text below and call "
+                        "save_proposal_index with the extracted metadata."
+                    ),
+                    **parsed,
+                }
 
-        # Otherwise, check for subdirectories and batch-index them
+        # --- Nested folder: batch processing ---
         all_subdirs = sorted(
             d for d in folder_path.iterdir()
             if d.is_dir() and not d.name.startswith(".")
@@ -335,62 +390,180 @@ def register_indexing_tools(
         batch = pending_subdirs[:batch_size]
 
         logger.info(
-            "Batch indexing %d of %d pending subfolders in %s "
-            "(%d already indexed)",
-            len(batch), len(pending_subdirs), folder_name, previously_done,
+            "Batch processing %d of %d pending subfolders in %s "
+            "(%d already indexed, mode=%s)",
+            len(batch), len(pending_subdirs), folder_name,
+            previously_done, "llm" if has_llm else "data_tool",
         )
 
         results = []
+        parsed_items = []  # For data-tool mode
         failed = []
         skipped = []
 
         for i, subdir in enumerate(batch, 1):
             sub_name = f"{folder_name}/{subdir.name}"
             logger.info(
-                "Indexing [%d/%d in batch, %d/%d overall]: %s",
+                "Processing [%d/%d in batch, %d/%d overall]: %s",
                 i, len(batch),
-                previously_done + len(results) + len(skipped) + len(failed) + 1,
+                previously_done + len(results) + len(parsed_items) + len(skipped) + len(failed) + 1,
                 total,
                 sub_name,
             )
             try:
-                result = await _index_single_folder(sub_name, subdir)
-                results.append(result)
+                if has_llm:
+                    result = await _index_single_folder_with_llm(sub_name, subdir)
+                    results.append(result)
+                else:
+                    parsed = await _parse_folder_files(sub_name, subdir)
+                    parsed_items.append(parsed)
             except ValueError as e:
-                # No parseable files in this subfolder
                 skipped.append({"folder": sub_name, "reason": str(e)})
                 logger.info("Skipped %s: %s", sub_name, e)
             except Exception as e:
                 failed.append({"folder": sub_name, "error": str(e)})
-                logger.error("Failed to index %s: %s", sub_name, e)
+                logger.error("Failed to process %s: %s", sub_name, e)
 
         done_after = previously_done + len(results) + len(skipped)
-        remaining = total - done_after - len(failed)
-        progress_pct = round(done_after / total * 100, 1)
-        complete = remaining <= 0
+        # In data-tool mode, parsed_items are not "done" until save_proposal_index is called
+        if has_llm:
+            remaining = total - done_after - len(failed)
+        else:
+            remaining = len(pending_subdirs) - len(parsed_items) - len(skipped) - len(failed)
+            done_after = previously_done + len(skipped)
 
-        return {
+        progress_pct = round(
+            (previously_done + len(results) + len(skipped)) / total * 100, 1
+        )
+        complete = has_llm and remaining <= 0
+
+        response: dict = {
             "batch": True,
             "parent_folder": folder_name,
             "total_subfolders": total,
             "previously_indexed": previously_done,
-            "indexed_this_batch": len(results),
             "failed": len(failed),
             "skipped": len(skipped),
-            "done_so_far": done_after,
-            "remaining": max(remaining, 0),
             "progress_percent": progress_pct,
             "complete": complete,
-            "message": (
-                f"Batch complete: indexed {len(results)}, "
-                f"skipped {len(skipped)}, failed {len(failed)}. "
-                f"Overall progress: {done_after}/{total} ({progress_pct}%). "
-                + ("All done!" if complete else f"{remaining} remaining — call again to continue.")
-            ),
-            "results": results,
             "failures": failed,
             "skipped_details": skipped,
         }
+
+        if has_llm:
+            response.update({
+                "mode": "llm",
+                "indexed_this_batch": len(results),
+                "done_so_far": done_after,
+                "remaining": max(remaining, 0),
+                "message": (
+                    f"Batch complete: indexed {len(results)}, "
+                    f"skipped {len(skipped)}, failed {len(failed)}. "
+                    f"Overall progress: {done_after}/{total} ({progress_pct}%). "
+                    + ("All done!" if complete else f"{remaining} remaining — call again to continue.")
+                ),
+                "results": results,
+            })
+        else:
+            response.update({
+                "mode": "data_tool",
+                "needs_save": True,
+                "parsed_this_batch": len(parsed_items),
+                "remaining": max(remaining, 0),
+                "message": (
+                    f"Parsed {len(parsed_items)} folders (skipped {len(skipped)}, "
+                    f"failed {len(failed)}). "
+                    f"Previously indexed: {previously_done}/{total}. "
+                    f"Analyze each parsed folder below and call save_proposal_index "
+                    f"for each one. Then call index_past_proposal again to continue "
+                    f"with the next batch."
+                ),
+                "parsed_folders": parsed_items,
+            })
+
+        return response
+
+    @mcp.tool()
+    async def save_proposal_index(
+        folder_name: str,
+        title: str,
+        client: str = "",
+        sector: str = "",
+        country: str = "",
+        tender_number: str = "",
+        technical_summary: str = "",
+        pricing_summary: str = "",
+        total_price: float = 0.0,
+        margin_info: str = "",
+        technologies: list[str] | None = None,
+        keywords: list[str] | None = None,
+        full_summary: str = "",
+    ) -> dict:
+        """Save structured metadata for a past proposal after analysis.
+
+        Call this after index_past_proposal returns parsed text in data-tool mode.
+        Analyze the parsed text, extract the metadata fields, and pass them here
+        to store in the database, generate the _summary.md file, and create
+        vector embeddings for search.
+
+        Args:
+            folder_name: Exact folder_name as returned by index_past_proposal
+                         (e.g., "TRA/TRA000208-Cisco Switches")
+            title: Full tender/project title
+            client: Issuing organization name
+            sector: One of: telecom, it, infrastructure, security, energy, general
+            country: Two-letter country code (e.g., OM, AE, SA)
+            tender_number: RFP/tender reference number
+            technical_summary: 2-3 paragraph summary of the technical solution
+            pricing_summary: Summary of pricing structure and key cost components
+            total_price: Total price as a number
+            margin_info: Margin percentages if found
+            technologies: List of specific products, vendors, technologies mentioned
+            keywords: 10-20 searchable keywords covering scope, sector, tech
+            full_summary: Comprehensive 3-5 paragraph summary of the entire proposal
+
+        Returns:
+            Dict with index_id, folder_name, title, and confirmation details
+        """
+        techs = technologies or []
+        kws = keywords or []
+
+        # Resolve the folder path
+        folder_path = past_dir / folder_name
+        if not folder_path.exists() or not folder_path.is_dir():
+            raise ValueError(
+                f"Folder not found: {folder_path}. "
+                f"The folder_name must match exactly what index_past_proposal returned."
+            )
+
+        # Count actual files for the record
+        files = sorted(
+            f for f in folder_path.iterdir()
+            if f.is_file()
+            and f.suffix.lower() in INDEXABLE_EXTENSIONS
+            and not f.name.startswith("_")
+        )
+        file_list = [f.name for f in files]
+
+        extracted = {
+            "title": title,
+            "client": client,
+            "sector": sector,
+            "country": country,
+            "tender_number": tender_number,
+            "technical_summary": technical_summary,
+            "pricing_summary": pricing_summary,
+            "total_price": total_price,
+            "margin_info": margin_info,
+            "technologies": techs,
+            "keywords": kws,
+            "full_summary": full_summary,
+        }
+
+        return await _save_extracted(
+            folder_name, folder_path, extracted,
+            len(files), file_list,
+        )
 
     @mcp.tool()
     async def search_past_proposals(

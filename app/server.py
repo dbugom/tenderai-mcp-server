@@ -37,11 +37,16 @@ def build_server(settings: Settings) -> tuple[FastMCP, Database]:
     db = Database(settings.abs_database_path(), embedding_dimensions=settings.embedding_dimensions)
 
     # --- Services ---
-    llm = LLMService(
-        api_key=settings.anthropic_api_key,
-        model=settings.llm_model,
-        max_tokens=settings.llm_max_tokens,
-    )
+    llm = None
+    if settings.anthropic_api_key:
+        llm = LLMService(
+            api_key=settings.anthropic_api_key,
+            model=settings.llm_model,
+            max_tokens=settings.llm_max_tokens,
+        )
+        logger.info("LLM service enabled (ANTHROPIC_API_KEY set)")
+    else:
+        logger.info("LLM service disabled — data-tool mode (Claude does reasoning)")
     parser = ParserService(data_dir=settings.abs_data_dir())
     docwriter = DocWriterService(
         output_dir=settings.abs_data_dir() / "generated_proposals",
