@@ -433,7 +433,7 @@ def register_indexing_tools(
     @mcp.tool()
     async def index_past_proposal(
         folder_name: str,
-        batch_size: int = 10,
+        batch_size: int = 0,
         skip_already_indexed: bool = True,
     ) -> dict:
         """Parse all files in a past proposal folder and index for fast search.
@@ -449,15 +449,13 @@ def register_indexing_tools(
         parseable files, each subdirectory is processed as a separate proposal.
         For example, folder_name="TRA" will process all subfolders inside TRA/.
 
-        For large parent folders, processes in batches. Call this tool repeatedly
-        with the same folder_name until progress shows 100% complete.
-
         Args:
             folder_name: Name of the folder inside data/past_proposals/
                          Can be a single proposal folder or a parent folder
                          containing multiple proposal subfolders.
-            batch_size: Number of subfolders to process per call (default 10).
-                        Only applies to parent folders with subdirectories.
+            batch_size: Max subfolders to process per call. Default 0 means
+                        process ALL in one call. Use a smaller number (e.g. 20)
+                        if you want incremental progress across multiple calls.
             skip_already_indexed: Skip subfolders that have already been indexed
                                   (default True). Set to False to re-index all.
 
@@ -529,8 +527,8 @@ def register_indexing_tools(
                 "message": f"All {total} subfolders already indexed. Nothing to do.",
             }
 
-        # Process only batch_size folders in this call
-        batch = pending_subdirs[:batch_size]
+        # Process folders — all at once (batch_size=0) or in chunks
+        batch = pending_subdirs if batch_size <= 0 else pending_subdirs[:batch_size]
 
         _index_fn = _index_single_folder_with_llm if has_llm else _index_single_folder_basic
 
