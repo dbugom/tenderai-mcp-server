@@ -673,6 +673,63 @@ def register_indexing_tools(
         )
 
     @mcp.tool()
+    async def get_proposal_details(
+        folder_name: str,
+        include_parsed_text: bool = False,
+    ) -> dict:
+        """Get full details of an indexed proposal by folder name.
+
+        Returns all stored metadata including pricing summary, technical summary,
+        total price, technologies, and keywords. Optionally re-parses the original
+        files to return the full text content.
+
+        Args:
+            folder_name: Exact folder name (e.g., "TRA/TRA000227-Samsung 55")
+            include_parsed_text: If True, re-parses the original files and includes
+                                 the full text content (useful for detailed analysis)
+
+        Returns:
+            Dict with all indexed metadata fields, plus parsed_text if requested
+        """
+        record = await db.get_proposal_index_by_folder(folder_name)
+        if not record:
+            raise ValueError(
+                f"No indexed proposal found for folder '{folder_name}'. "
+                f"Use list_indexed_proposals to see available folders."
+            )
+
+        result = {
+            "index_id": record["id"],
+            "folder_name": record["folder_name"],
+            "tender_number": record.get("tender_number", ""),
+            "title": record.get("title", ""),
+            "client": record.get("client", ""),
+            "sector": record.get("sector", ""),
+            "country": record.get("country", ""),
+            "technical_summary": record.get("technical_summary", ""),
+            "pricing_summary": record.get("pricing_summary", ""),
+            "total_price": record.get("total_price", 0.0),
+            "margin_info": record.get("margin_info", ""),
+            "technologies": record.get("technologies", []),
+            "keywords": record.get("keywords", []),
+            "full_summary": record.get("full_summary", ""),
+            "file_count": record.get("file_count", 0),
+            "file_list": record.get("file_list", []),
+            "indexed_at": record.get("indexed_at", ""),
+        }
+
+        if include_parsed_text:
+            folder_path = past_dir / folder_name
+            if folder_path.exists() and folder_path.is_dir():
+                try:
+                    parsed = await _parse_folder_files(folder_name, folder_path)
+                    result["parsed_text"] = parsed["combined_text"]
+                except Exception as e:
+                    result["parsed_text_error"] = str(e)
+
+        return result
+
+    @mcp.tool()
     async def search_past_proposals(
         query: str, sector: str = "", limit: int = 5, mode: str = "auto"
     ) -> dict:
@@ -787,11 +844,14 @@ def register_indexing_tools(
             proposals.append({
                 "index_id": r["id"],
                 "folder_name": r["folder_name"],
+                "tender_number": r.get("tender_number", ""),
                 "title": r.get("title", ""),
                 "client": r.get("client", ""),
                 "sector": r.get("sector", ""),
                 "country": r.get("country", ""),
                 "total_price": r.get("total_price", 0.0),
+                "pricing_summary": r.get("pricing_summary", ""),
+                "margin_info": r.get("margin_info", ""),
                 "file_count": r.get("file_count", 0),
                 "technologies": r.get("technologies", []),
                 "indexed_at": r.get("indexed_at", ""),
