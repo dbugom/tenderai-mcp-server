@@ -244,7 +244,7 @@ def register_indexing_tools(
         """Extract basic metadata from folder name and text without LLM.
 
         Parses the folder name pattern (e.g., 'TRA/TRA000208-Cisco Switches')
-        and scans text for prices and keywords.
+        and scans text for prices, client names, and keywords.
         """
         import re
 
@@ -255,44 +255,130 @@ def register_indexing_tools(
         tender_number = parts[0].strip() if parts else base_name
         title = parts[1].strip() if len(parts) > 1 else base_name
 
-        # Try to find total price from text (look for common patterns)
+        # --- Extract client name ---
+        client = ""
+        # Look for "Customer: X" or "Client: X" patterns
+        client_match = re.search(
+            r'(?:customer|client)\s*:\s*([^\n]+)', combined_text, re.IGNORECASE
+        )
+        if client_match:
+            client = client_match.group(1).strip()
+
+        # --- Extract total price ---
+        # Strategy: find ALL price-like values near "total" keywords, pick the best
         total_price = 0.0
-        # Match patterns like "Grand Total: 1,234.56" or "Total OMR 1234.56"
+        text_lower = combined_text.lower()
+
+        # Pattern 1: "Grand Total Including VAT OMR 3,883.950" (PDF format)
+        # Pattern 2: "Grand Total OMR 3699.000"
+        # Pattern 3: "Total amount ... 5424.3" (XLSX table row)
+        # Pattern 4: "TOTAL AMOUNT | 5424.3"
+        # Pattern 5: "Total Price OMR 1234.56"
         price_patterns = [
-            r'(?:grand\s*total|total\s*(?:price|cost|amount|omr|aed|usd))[:\s]*[\$]?\s*([\d,]+\.?\d*)',
-            r'(?:total)[:\s]*(?:omr|aed|usd|sar)?\s*([\d,]+\.?\d*)',
+            # "Grand Total Including VAT" followed by currency + number
+            r'grand\s*total\s*(?:including|incl\.?)\s*(?:vat|tax)\s*(?:omr|aed|usd|sar|qar)?\s*([\d,]+\.?\d*)',
+            # "Grand Total Excluding VAT" followed by currency + number
+            r'grand\s*total\s*(?:excluding|excl\.?)\s*(?:vat|tax)\s*(?:omr|aed|usd|sar|qar)?\s*([\d,]+\.?\d*)',
+            # "Grand Total" followed by currency + number
+            r'grand\s*total\s*(?:omr|aed|usd|sar|qar)?\s*([\d,]+\.?\d+)',
+            # Currency followed by number near "grand total"
+            r'grand\s*total[^\n]*?(?:omr|aed|usd|sar|qar)\s*([\d,]+\.?\d+)',
+            # "Total amount" in table: "Total amount | ... | 5424.3"
+            r'total\s*amount[^\n]*?([\d,]+\.?\d+)\s*(?:\||\n|$)',
+            # "Total Price" followed by currency + number
+            r'total\s*price\s*(?:omr|aed|usd|sar|qar)?\s*([\d,]+\.?\d+)',
+            # "Total" followed by currency + number (broader)
+            r'(?:^|\|)\s*total\s*(?:omr|aed|usd|sar|qar)\s*([\d,]+\.?\d+)',
+            # Currency then number after any "total" keyword
+            r'total[^\n]{0,30}?(?:omr|aed|usd|sar|qar)\s*([\d,]+\.?\d+)',
         ]
+
+        candidates = []
         for pattern in price_patterns:
-            matches = re.findall(pattern, combined_text.lower())
-            if matches:
+            for m in re.finditer(pattern, text_lower):
                 try:
-                    val = float(matches[-1].replace(",", ""))
-                    if val > total_price:
-                        total_price = val
+                    val = float(m.group(1).replace(",", ""))
+                    # Filter out version numbers (1.0, 2.0) and tiny values
+                    if val > 10:
+                        candidates.append(val)
                 except ValueError:
                     pass
 
-        # Extract a brief summary from the first ~500 chars of non-financial text
-        summary_text = combined_text[:500].strip()
+        if candidates:
+            # Prefer the largest "grand total" value (likely includes VAT)
+            total_price = max(candidates)
+
+        # --- Build pricing summary ---
+        pricing_lines = []
+        # Find all lines containing price-related info
+        for line in combined_text.split("\n"):
+            line_lower = line.lower().strip()
+            if any(kw in line_lower for kw in ["grand total", "total amount", "total price", "subtotal", "vat"]):
+                clean = line.strip()
+                if clean and len(clean) < 200:
+                    pricing_lines.append(clean)
+        pricing_summary = "\n".join(pricing_lines[:5]) if pricing_lines else (
+            f"Total: {total_price}" if total_price else ""
+        )
+
+        # --- Extract quantities ---
+        # Look for QTY column values
+        qty_matches = re.findall(r'(?:qty|quantity)\s*[|:]\s*(\d+)', text_lower)
+        total_qty = sum(int(q) for q in qty_matches) if qty_matches else 0
+
+        # --- Extract a brief summary ---
+        # Skip the header/cover page, look for introduction or description
+        summary_text = ""
+        intro_match = re.search(
+            r'(?:introduction|overview|scope|subject)[:\s]*\n?(.*?)(?:\n\d+\.|\n[A-Z]{2,}|\Z)',
+            combined_text, re.IGNORECASE | re.DOTALL,
+        )
+        if intro_match:
+            summary_text = intro_match.group(1).strip()[:500]
+        if not summary_text:
+            summary_text = combined_text[:500].strip()
+
         if len(summary_text) > 100:
-            # Try to end at a sentence boundary
             last_period = summary_text.rfind(".")
             if last_period > 100:
                 summary_text = summary_text[:last_period + 1]
 
-        # Generate keywords from folder name
+        # --- Extract title from document if folder name is just a number ---
+        if not title or title == base_name:
+            # Look for tender title in text: "Supply of X" or "Tender No: X \n Title"
+            title_match = re.search(
+                r'(?:tender\s*(?:no|#|number)[:\s]*\S+\s*\)?\s*\n?\s*)([^\n(]+)',
+                combined_text, re.IGNORECASE,
+            )
+            if title_match:
+                extracted_title = title_match.group(1).strip()
+                if len(extracted_title) > 3 and not extracted_title[0].isdigit():
+                    title = extracted_title
+
+        # --- Generate keywords from folder name + key terms ---
         keywords = [w for w in re.split(r'[\s\-_/]+', base_name) if len(w) > 2]
+        # Add product/brand names found in text
+        brand_patterns = [
+            r'\b(cisco|dell|hp|lenovo|samsung|lg|fortinet|fortigate|microsoft|surface|'
+            r'huawei|mikrotik|palo\s*alto|aruba|juniper|ubiquiti|hikvision|dahua|'
+            r'canon|epson|brother|xerox|ricoh|konica)\b'
+        ]
+        for bp in brand_patterns:
+            for bm in re.finditer(bp, text_lower):
+                brand = bm.group(1).strip().title()
+                if brand not in keywords:
+                    keywords.append(brand)
 
         return {
             "title": title or base_name,
             "tender_number": tender_number,
-            "client": "",
+            "client": client,
             "sector": "it",
             "country": "OM",
             "technical_summary": summary_text,
-            "pricing_summary": f"Total: {total_price}" if total_price else "",
+            "pricing_summary": pricing_summary,
             "total_price": total_price,
-            "margin_info": "",
+            "margin_info": f"Quantity: {total_qty}" if total_qty else "",
             "technologies": [],
             "keywords": keywords,
             "full_summary": summary_text,
