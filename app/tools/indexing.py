@@ -92,28 +92,8 @@ def register_indexing_tools(
                 return ""
         return ""
 
-    @mcp.tool()
-    async def index_past_proposal(folder_name: str) -> dict:
-        """Parse all files in a past proposal folder, extract structured metadata via LLM, and index for fast search.
-
-        Scans the folder, parses all supported files (PDF, DOCX, XLSX, MD, TXT),
-        sends combined content to the LLM for structured extraction, saves a
-        human-readable _summary.md file, and upserts the index into the database
-        for FTS5 full-text search.
-
-        Args:
-            folder_name: Name of the folder inside data/past_proposals/
-
-        Returns:
-            Dict with index_id, folder_name, title, client, sector, file_count, and technologies
-        """
-        folder_path = past_dir / folder_name
-        if not folder_path.exists() or not folder_path.is_dir():
-            raise ValueError(
-                f"Folder not found: {folder_path}. "
-                f"Expected a directory inside data/past_proposals/"
-            )
-
+    async def _index_single_folder(folder_name: str, folder_path: Path) -> dict:
+        """Index a single proposal folder (internal helper)."""
         # Collect all parseable files, skipping _-prefixed files
         files = sorted(
             f for f in folder_path.iterdir()
@@ -255,6 +235,161 @@ def register_indexing_tools(
             "technologies": index_record.get("technologies", []),
             "summary_path": str(summary_path),
             "vector_indexed": vector_stored,
+        }
+
+    @mcp.tool()
+    async def index_past_proposal(
+        folder_name: str,
+        batch_size: int = 10,
+        skip_already_indexed: bool = True,
+    ) -> dict:
+        """Parse all files in a past proposal folder, extract structured metadata via LLM, and index for fast search.
+
+        Scans the folder, parses all supported files (PDF, DOCX, XLSX, MD, TXT),
+        sends combined content to the LLM for structured extraction, saves a
+        human-readable _summary.md file, and upserts the index into the database
+        for FTS5 full-text search.
+
+        Supports nested folders: if the folder contains subdirectories instead of
+        parseable files, each subdirectory is indexed as a separate proposal.
+        For example, folder_name="TRA" will index all subfolders inside TRA/.
+
+        For large parent folders, processes in batches. Call this tool repeatedly
+        with the same folder_name until progress shows 100% complete.
+
+        Args:
+            folder_name: Name of the folder inside data/past_proposals/
+                         Can be a single proposal folder or a parent folder
+                         containing multiple proposal subfolders.
+            batch_size: Number of subfolders to process per call (default 10).
+                        Only applies to parent folders with subdirectories.
+            skip_already_indexed: Skip subfolders that have already been indexed
+                                  (default True). Set to False to re-index all.
+
+        Returns:
+            Dict with index_id, folder_name, title, client, sector, file_count, and technologies.
+            If the folder contains subfolders, returns a batch result with progress info.
+        """
+        folder_path = past_dir / folder_name
+        if not folder_path.exists() or not folder_path.is_dir():
+            raise ValueError(
+                f"Folder not found: {folder_path}. "
+                f"Expected a directory inside data/past_proposals/"
+            )
+
+        # Check if folder has parseable files directly
+        direct_files = [
+            f for f in folder_path.iterdir()
+            if f.is_file()
+            and f.suffix.lower() in INDEXABLE_EXTENSIONS
+            and not f.name.startswith("_")
+        ]
+
+        # If it has parseable files, index it as a single proposal
+        if direct_files:
+            return await _index_single_folder(folder_name, folder_path)
+
+        # Otherwise, check for subdirectories and batch-index them
+        all_subdirs = sorted(
+            d for d in folder_path.iterdir()
+            if d.is_dir() and not d.name.startswith(".")
+        )
+
+        if not all_subdirs:
+            raise ValueError(
+                f"No parseable files or subdirectories found in {folder_path}"
+            )
+
+        total = len(all_subdirs)
+
+        # Determine which folders still need indexing
+        already_indexed = []
+        pending_subdirs = []
+
+        for subdir in all_subdirs:
+            sub_name = f"{folder_name}/{subdir.name}"
+            if skip_already_indexed:
+                existing = await db.get_proposal_index_by_folder(sub_name)
+                if existing:
+                    already_indexed.append(sub_name)
+                    continue
+            pending_subdirs.append(subdir)
+
+        previously_done = len(already_indexed)
+
+        if not pending_subdirs:
+            return {
+                "batch": True,
+                "parent_folder": folder_name,
+                "total_subfolders": total,
+                "previously_indexed": previously_done,
+                "indexed_this_batch": 0,
+                "failed": 0,
+                "skipped": 0,
+                "progress_percent": 100,
+                "complete": True,
+                "message": f"All {total} subfolders already indexed. Nothing to do.",
+            }
+
+        # Process only batch_size folders in this call
+        batch = pending_subdirs[:batch_size]
+
+        logger.info(
+            "Batch indexing %d of %d pending subfolders in %s "
+            "(%d already indexed)",
+            len(batch), len(pending_subdirs), folder_name, previously_done,
+        )
+
+        results = []
+        failed = []
+        skipped = []
+
+        for i, subdir in enumerate(batch, 1):
+            sub_name = f"{folder_name}/{subdir.name}"
+            logger.info(
+                "Indexing [%d/%d in batch, %d/%d overall]: %s",
+                i, len(batch),
+                previously_done + len(results) + len(skipped) + len(failed) + 1,
+                total,
+                sub_name,
+            )
+            try:
+                result = await _index_single_folder(sub_name, subdir)
+                results.append(result)
+            except ValueError as e:
+                # No parseable files in this subfolder
+                skipped.append({"folder": sub_name, "reason": str(e)})
+                logger.info("Skipped %s: %s", sub_name, e)
+            except Exception as e:
+                failed.append({"folder": sub_name, "error": str(e)})
+                logger.error("Failed to index %s: %s", sub_name, e)
+
+        done_after = previously_done + len(results) + len(skipped)
+        remaining = total - done_after - len(failed)
+        progress_pct = round(done_after / total * 100, 1)
+        complete = remaining <= 0
+
+        return {
+            "batch": True,
+            "parent_folder": folder_name,
+            "total_subfolders": total,
+            "previously_indexed": previously_done,
+            "indexed_this_batch": len(results),
+            "failed": len(failed),
+            "skipped": len(skipped),
+            "done_so_far": done_after,
+            "remaining": max(remaining, 0),
+            "progress_percent": progress_pct,
+            "complete": complete,
+            "message": (
+                f"Batch complete: indexed {len(results)}, "
+                f"skipped {len(skipped)}, failed {len(failed)}. "
+                f"Overall progress: {done_after}/{total} ({progress_pct}%). "
+                + ("All done!" if complete else f"{remaining} remaining — call again to continue.")
+            ),
+            "results": results,
+            "failures": failed,
+            "skipped_details": skipped,
         }
 
     @mcp.tool()
